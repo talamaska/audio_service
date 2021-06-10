@@ -1,14 +1,19 @@
 import 'dart:async';
-import 'dart:io' show Platform;
-import 'dart:math';
+import 'dart:convert';
+import 'dart:developer';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
-import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:rxdart/rxdart.dart';
+
+import 'package:audio_service/audio_service.dart';
+import 'package:audio_service_example/image_cache_manager.dart';
 
 void main() => runApp(new MyApp());
 
@@ -18,12 +23,43 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Audio Service Demo',
       theme: ThemeData(primarySwatch: Colors.blue),
-      home: AudioServiceWidget(child: MainScreen()),
+      home: AudioServiceWidget(
+        child: MainScreen(
+          repo: ImageCacheManager(),
+        ),
+      ),
     );
   }
 }
 
-class MainScreen extends StatelessWidget {
+class MainScreen extends StatefulWidget {
+  const MainScreen({
+    Key? key,
+    required this.repo,
+  }) : super(key: key);
+
+  final ImageCacheManager repo;
+
+  @override
+  _MainScreenState createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  String? _filePath;
+
+  Future<void> moveFile() async {
+    final Uint8List? bytes =
+        await widget.repo.getAssetFile('assets/images/spok.jpg');
+    if (bytes != null) {
+      await widget.repo.saveImage('spok.jpg', bytes);
+      final _path = await widget.repo.getImagePath('spok.jpg');
+      setState(() {
+        _filePath = _path;
+        log('$_filePath');
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -44,6 +80,50 @@ class MainScreen extends StatelessWidget {
             return Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
+                Image.asset(
+                  'assets/images/spok.jpg',
+                  width: 75,
+                  height: 75,
+                ),
+                ElevatedButton(
+                  onPressed: moveFile,
+                  child: Text('Move file to temp folder'),
+                ),
+                if (_filePath != null)
+                  Image.file(
+                    File(_filePath!),
+                    width: 75,
+                    height: 75,
+                  ),
+                if (_filePath != null) Text('temp file path $_filePath'),
+                if (_filePath != null && running)
+                  ElevatedButton(
+                    onPressed: () async {
+                      final MediaItem mediaItem = MediaItem(
+                        id: "https://s3.amazonaws.com/scifri-segments/scifri201711241.mp3",
+                        album: "This is a test Album",
+                        title: "This is a test title",
+                        artist: "This is a test Artist",
+                        duration: Duration(milliseconds: 2856950),
+                        artUri: Uri.parse(_filePath!),
+                      );
+                      debugPrint('temp file path $_filePath');
+                      debugPrint(
+                          'player initialized, update queue with $mediaItem');
+                      await AudioService.updateQueue([
+                        mediaItem,
+                      ]);
+                    },
+                    child: Text('Update Playlist'),
+                  ),
+                if (running)
+                  ElevatedButton(
+                    onPressed: () async {
+                      await AudioService.playFromMediaId(
+                          'https://s3.amazonaws.com/scifri-episodes/scifri20181123-episode.mp3');
+                    },
+                    child: Text('Play from song'),
+                  ),
                 if (!running) ...[
                   // UI to show when we're not running, i.e. a menu.
                   audioPlayerButton(),
@@ -259,7 +339,8 @@ class _SeekBarState extends State<SeekBar> {
 
   @override
   Widget build(BuildContext context) {
-    final value = min(_dragValue ?? widget.position.inMilliseconds.toDouble(),
+    final value = math.min(
+        _dragValue ?? widget.position.inMilliseconds.toDouble(),
         widget.duration.inMilliseconds.toDouble());
     if (_dragValue != null && !_dragging) {
       _dragValue = null;
@@ -318,7 +399,17 @@ class AudioPlayerTask extends BackgroundAudioTask {
   Seeker? _seeker;
   late StreamSubscription<PlaybackEvent> _eventSubscription;
 
-  List<MediaItem> get queue => _mediaLibrary.items;
+  List<MediaItem> queue = [
+    MediaItem(
+      id: "https://s3.amazonaws.com/scifri-episodes/scifri20181123-episode.mp3",
+      album: "Science Friday",
+      title: "A Salute To Head-Scratching Science",
+      artist: "Science Friday and WNYC Studios",
+      duration: Duration(milliseconds: 5739820),
+      artUri: Uri.parse(
+          "https://media.wnyc.org/i/1400/1400/l/80/1/ScienceFriday_WNYCStudios_1400.jpg"),
+    )
+  ];
   int? get index => _player.currentIndex;
   MediaItem? get mediaItem => index == null ? null : queue[index!];
 
@@ -362,7 +453,7 @@ class AudioPlayerTask extends BackgroundAudioTask {
             queue.map((item) => AudioSource.uri(Uri.parse(item.id))).toList(),
       ));
       // In this example, we automatically start playing on start.
-      onPlay();
+      // onPlay();
     } catch (e) {
       print("Error: $e");
       onStop();
@@ -388,6 +479,28 @@ class AudioPlayerTask extends BackgroundAudioTask {
     _player.seek(Duration.zero, index: newIndex);
     // Demonstrate custom events.
     AudioServiceBackground.sendCustomEvent('skip to $newIndex');
+  }
+
+  @override
+  Future<void> onUpdateQueue(List<MediaItem> q) async {
+    print('onUpdate queue ${queue.length}');
+    queue = q;
+    await AudioServiceBackground.setQueue(queue);
+    await _player.setAudioSource(ConcatenatingAudioSource(
+      children: queue
+          .map(
+            (MediaItem item) => AudioSource.uri(
+              Uri.parse(item.id),
+              tag: AudioMetadata(
+                album: item.album,
+                title: item.title,
+                artist: item.artist,
+                artwork: item.artUri.toString(),
+              ),
+            ),
+          )
+          .toList(),
+    ));
   }
 
   @override
@@ -758,5 +871,61 @@ class Seeker {
 
   stop() {
     _running = false;
+  }
+}
+
+class AudioMetadata {
+  const AudioMetadata({
+    this.album,
+    this.title,
+    this.artwork,
+    this.artist,
+  });
+
+  final String? album;
+  final String? title;
+  final String? artwork;
+  final String? artist;
+
+  AudioMetadata copyWith({
+    String? album,
+    String? title,
+    String? artwork,
+    String? artist,
+  }) {
+    return AudioMetadata(
+      album: album ?? this.album,
+      title: title ?? this.title,
+      artwork: artwork ?? this.artwork,
+      artist: artist ?? this.artist,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'album': album,
+      'title': title,
+      'artwork': artwork,
+      'artist': artist,
+    };
+  }
+
+  factory AudioMetadata.fromMap(Map<String, dynamic> map) {
+    return AudioMetadata(
+      album: map['album'],
+      title: map['title'],
+      artwork: map['artwork'],
+      artist: map['artist'],
+    );
+  }
+
+  String toJson() => json.encode(toMap());
+
+  factory AudioMetadata.fromJson(String source) =>
+      AudioMetadata.fromMap(json.decode(source));
+
+  @override
+  String toString() {
+    return 'AudioMetadata(album: $album, title: $title, artwork: $artwork, artist: $artist)';
   }
 }
